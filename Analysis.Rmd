@@ -1,0 +1,261 @@
+---
+title: 'Practical Machine Learning: Prediction Assignment'
+author: "Johan Vásquez Mazo"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+
+In this project, data from accelerometers placed on the belt, forearm, arm, and dumbell of six participants are explored. These data are then used to predict the way in which the subjects performed barbell lifts, as an experiment of the quantified self movement. There were six possible measured classes of performing the barbell lifts, only one of which is correct. Some machine learning models, namely decision trees, random forests, gradient boosting, and linear discriminant analysis were employed to predict said class given the whole set of variables. It was found that a random forest model was the best-performing among the four, having an estimated out-of-sample error of 0.0089. This model was then used on an independent dataset with unknown outcome, predicting that only 7 of 20 measurements were related to a correct barbell lift execution. Additionally, the effect of a high-leverage point on statistics such as mean and correlation is observed.
+
+# Data Tidying
+
+The first step is downloading the two datasets linked in the assignment: `training.csv` and `testing.csv`. These datasets come from the paper Qualitative Activity Recognition of Weight Lifting Exercises[^1].
+
+```{r downloadData, results = "hide"}
+# Download "training" dataset
+if (!file.exists("training.csv")) {
+    download.file(url = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", 
+                  destfile = "training.csv")
+}
+# Download "testing" dataset
+if (!file.exists("testing.csv")) {
+    download.file(url = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", 
+                  destfile = "testing.csv")
+}
+# Files in directory
+dir()
+```
+
+The next step is reading both datasets. The `training.csv` file is read into a data frame named `training`, and the `testing.csv` file is read into a data frame named `testing`. By checking their dimensions using `dim`, it is seen that `training` has 19622 observations of 160 variables, and `testing` has 20 observations of 160 variables. Since the percentage of `testing` observations is very low (0.1%), the `training` dataset must be partitioned into actual training and testing datasets. Moreover, an out-of-sample error cannot be estimated using the `testing` dataset because the outcome variable (`classe`) is not present in it.
+
+```{r readData, cache = TRUE}
+# Read datasets
+training <- read.csv("training.csv")
+testing <- read.csv("testing.csv")
+# Check dimensions
+dim(training)
+dim(testing)
+# "Testing" observations percentage
+dim(testing)[1]/(dim(training)[1] + dim(testing)[1])*100
+```
+
+After exploring the `training` dataset using the function `summary`, `str` and `View` in RStudio, it is seen that a lot of variables are mostly `NA`s, and some others are mostly empty characters, which is not reasonable since they should be numeric. Therefore, every variable that should be numeric is converted to such class. These are the 8th to 159th variables, which are mostly statistical measurements: average, standard deviation, variance, minimum, maximum, amplitude, skewness and kurtosis. It is also seen that the first 7 variables can be withdrawn, for they only serve to identify the measurements. Additionally, the last variable, `classe`, is converted into a factor, keeping in mind that it is the outcome to be predicted.
+
+```{r makeNumeric, warning = FALSE}
+# Convert non-numeric variables to numeric
+for (i in 8:159) {
+    training[ , i] <- as.numeric(training[ , i])
+}
+# Remove first 7 variables
+training <- training[ , -(1:7)]
+# Convert last variable to factor
+training$classe <- as.factor(training$classe)
+```
+
+When coercing empty characters into numeric, the result is `NA`, so the following step is handling that large value of `NA`s. After calculating the total number of `NA`s for each variable, it is seen that the result is either 0, or greater than or equal to 19216; i.e., every variable either has no `NA`s or is mostly `NA`s. That being said, the next step is removing the mostly `NA` variables. This is performed by setting a threshold for the percentage of `NA` values equal to 10% for each variable.
+
+```{r checkNAs}
+# Calculate total number of NAs for each variable
+min(setdiff(sapply(training, function(x) {sum(is.na(x))}), 0))
+# Calculate which variables meet the NA percentage threshold
+cols <- sapply(training, function(x) {mean(is.na(x)) <= 0.1})
+```
+
+The resulting data frame has 19622 observations of only 53 variables, and there is no need of imputing missing values since there are none.
+
+```{r removeNAcols}
+training <- training[ , cols]
+dim(training)
+```
+
+# Exploratory Data Analyses
+
+Now that the `training` dataset is tidy, it is partitioned into a `Train` data frame and a `Test` data frame, which are actual training and testing datasets in order to guarantee that cross-validation can be performed. The `Train` data frame contains 80% of the original observations, and the `Test` data frame contains the remaining 20%.
+
+```{r createDataPartitions, cache = TRUE}
+suppressWarnings(suppressMessages(library(caret)))
+set.seed(1404)
+# Create subtraining and subtesting datasets
+inTrain <- createDataPartition(training$classe, p = 0.8, list = FALSE)
+Train <- training[inTrain, ]
+Test <- training[-inTrain, ]
+# Check dimensions
+dim(Train)
+dim(Test)
+```
+
+In order to further explore the data, the correlation matrix is calculated to get a grasp of whether some variables may be good predictors or not. The diagonal of this matrix is then set to zero to know which variables are the most correlated.
+
+```{r CorrelationMatrix}
+# Calculate correlation matrix
+corMatrix <- cor(Train[ , -53])
+# Set diagonal values to 0
+diag(corMatrix) <- 0
+```
+
+The plot of the modified correlation matrix is shown below, where red squares correspond to negatively correlated variables, and dark turquoise squares correspond to positively correlated variables. The smaller and whiter the square, the lower the magnitude of the correlation.
+
+```{r correlationPlot, message = FALSE, warning = FALSE, fig.width = 7, fig.height = 8, fig.align = "center"}
+library(corrplot)
+col1 <- colorRampPalette(c("red2", "snow1", "turquoise4"))
+corrplot(corMatrix, order = "FPC", method = "square", type = "lower", tl.col = "black", 
+         tl.cex = 0.7, col = col1(200))
+```
+
+From either the correlation matrix or its plot, it is found that the most negatively correlated variables are `accel_belt_z` and `roll_belt`, and the most positively correlated variables are `total_accel_belt` and `roll_belt`. Since the most correlated pairs of variables include `roll_belt` as one of them, this variable is excluded to examine other pairs of highly correlated variables. After excluding `roll_belt`, it is found that the most negatively correlated variables are `gyros_dumbbell_z` and `gyros_dumbbell_x`, and the most positively correlated variables are `gyros_forearm_z` and `gyros_dumbbell_z`. The following plot shows the scatterplots of the previous four pairs of variables including the `classe` outcome, so as to help identify if there are patterns between the variables and the outcome.
+
+```{r mostCorrelatedPlots, message = FALSE, warning = FALSE, fig.width = 7, fig.height = 6, fig.align = "center"}
+library(ggplot2)
+library(gridExtra)
+# Including roll_belt
+min1 <- ggplot(aes(x = accel_belt_z, y = roll_belt, col = classe), data = Train) + 
+    geom_point(alpha = 0.2) + theme_bw()
+max1 <- ggplot(aes(x = total_accel_belt, y = roll_belt, col = classe), data = Train) + 
+    geom_point(alpha = 0.8) + theme_bw()
+# Excluding roll_belt
+min2 <- ggplot(aes(x = gyros_dumbbell_z, y = gyros_dumbbell_x, col = classe), data = Train) + 
+    geom_point(alpha = 1) + theme_bw()
+max2 <- ggplot(aes(x = gyros_forearm_z, y = gyros_dumbbell_z, col = classe), data = Train) + 
+    geom_point(alpha = 1) + theme_bw()
+# Arranged plot
+grid.arrange(min1, max1, min2, max2, nrow = 2, ncol = 2)
+```
+
+Some interesting information can be drawn from the previous scatterplots. First, there does not appear to be an obvious pattern between the outcome and the variables `accel_belt_z`, `total_accel_belt` and `roll_belt`, so there is no hint as to what variables to choose as predictors based on correlation. However, there is a more intriguing fact about the plots, specifically the scatterplots of `gyros_dumbbell_z`, `gyros_dumbbell_x` and `gyros_forearm_z`. All the points in these scatterplots, but one, are relatively close; and the values for each variable of this outlier are far away from the rest of the data. This is a perfect example of the effect that one high leverage point can have on statistics such as mean and correlation. It cannot be determined if that outlier corresponds to faulty or genuine data; but, given that it is only 1 of 15699 observations and its values are extremely distant from all the other data, removing it seems reasonable.
+
+In addition to that, the outlier is removed from the `Train` dataset and the resulting data frame is named `Train2`. When recomputing the previous results for this data frame, it is seen that the correlation of `accel_belt_z` and `roll_belt` (-0.9921), and `total_accel_belt` and `roll_belt` (0.9808) remain the same; however, the correlation of `gyros_dumbbell_z` and `gyros_dumbbell_x` changes from -0.9830 to -0.6158, and the correlation of `gyros_forearm_z` and `gyros_dumbbell_z` changes from 0.9455 to 0.0578, basically meaning they are no longer correlated. Moreover, the scatterplots of the latter pairs of variables, without the outlier, show that there is no clear pattern explaining the relationship of the outcome and those variables. The code of this exploration is shown on Appendix A, and the two scatterplots aforementioned are built on Appendix B.
+
+# Prediction
+
+From the exploratory analyses, it was concluded that, for this dataset, correlation does not seem to be a good criterion of which variables to choose as predictors for the outcome `classe`. Since the outcome is a factor variable, models such as decision trees (CART), random forests (RF), gradient boosting (or generalized boosted models, GBM), and linear discriminant analysis (LDA) are good options. These four models will then be chosen to perform the predictions. As for cross-validation, k-fold cross-validation seems to be appropriate considering the size of the data, for leave-one-out cross-validation would require too much computation power. The chosen number of folds is 5, meaning that 20% of the `Train` data is used to cross-validate the model, and this is performed five times.
+
+```{r Training, message = FALSE, warning = FALSE, cache = TRUE}
+set.seed(1404)
+## Set k equal to 5 for k-folds cross-validation
+train.control <- trainControl(method = "cv", number = 5)
+## Train the models
+modelFitCART <- train(classe ~ ., data = Train, method = "rpart", trControl = train.control)
+modelFitRF <- train(classe ~ ., data = Train, method = "rf", trControl = train.control)
+modelFitGBM <- train(classe ~ ., data = Train, method = "gbm", trControl = train.control, verbose = FALSE)
+modelFitLDA <- train(classe ~ ., data = Train, method = "lda", trControl = train.control)
+```
+
+Now that the models are trained, it is time to evaluate their performance on the `Train` and `Test` datasets in order to calculate an in-sample error and, more importantly, estimate an out-of-sample error, respectively.
+
+```{r inSampleError, cache = TRUE}
+# Predictions on the Train dataset
+trainCART <- predict(modelFitCART, Train)
+trainRF <- predict(modelFitRF, Train)
+trainGBM <- predict(modelFitGBM, Train)
+trainLDA  <- predict(modelFitLDA, Train)
+# Calculated in-sample accuracies
+inCART <- confusionMatrix(trainCART, Train$classe)$overall[1]
+inRF <- confusionMatrix(trainRF, Train$classe)$overall[1]
+inGBM <- confusionMatrix(trainGBM, Train$classe)$overall[1]
+inLDA <- confusionMatrix(trainLDA, Train$classe)$overall[1]
+# Data frame with in-sample-errors
+inAccuracy <- data.frame(Model = c("CART", "RF", "GBM", "LDA"), 
+                         In.Sample.Accuracy = c(inCART, inRF, inGBM, inLDA))
+inAccuracy$In.Sample.Error <- 1 - inAccuracy$In.Sample.Accuracy
+inAccuracy
+```
+
+From the shown results, it is seen that the random forest model yields an in-sample accuracy of 1, having basically an in-sample error equal to 0, which means it is a perfect prediction model for the `Train` dataset; however, this may be due to overfitting, so this must be tested using the `Test` dataset. This seems reasonable since it was the model that took the longest to complete its training. On the other hand, the decision tree model was the worst performing, having an in-sample accuracy of 0.4961 and an in-sample error of 0.5039. The gradient boosting model also performed greatly, followed by the linear discriminant analysis model.
+
+```{r outofSampleError, cache = TRUE}
+# Predictions on the Test dataset
+testCART <- predict(modelFitCART, Test)
+testRF <- predict(modelFitRF, Test)
+testGBM <- predict(modelFitGBM, Test)
+testLDA  <- predict(modelFitLDA, Test)
+# Estimated out-of-sample accuracies
+outCART <- confusionMatrix(testCART, Test$classe)$overall[1]
+outRF <- confusionMatrix(testRF, Test$classe)$overall[1]
+outGBM <- confusionMatrix(testGBM, Test$classe)$overall[1]
+outLDA <- confusionMatrix(testLDA, Test$classe)$overall[1]
+# Data frame with out-of-sample errors
+outAccuracy <- data.frame(Model = c("CART", "RF", "GBM", "LDA"), 
+           Out.of.Sample.Accuracy = c(outCART, outRF, outGBM, outLDA))
+outAccuracy$Out.of.Sample.Error <- 1 - outAccuracy$Out.of.Sample.Accuracy
+outAccuracy
+```
+
+The final verdict will be based on the estimated out-of-sample errors by evaluating each model on the `Test` dataset. Again, as the results show, the random forest model had the greatest accuracy, whose value is 0.9911, and an out-of-sample error of 0.0089. The decision tree model was the worst performing as well, with an out-of-sample accuracy of 0.4948 and an out-of-sample error of 0.5052. The observed trend still holds: the gradient boosting model also performs greatly, followed by the linear discriminant analysis model.
+
+In conclusion, with an estimated out-of-sample error of 0.0089, the random forest model has the best performance among all the selected models.
+
+## Prediction
+
+Considering that the random forest model was the best-performing, it is used on the original `testing` dataset to predict the outcome `classe`. It is predicted that 7 out of the 20 measurements correspond to subjects who performed the weight lifting exercise correctly, as it is shown below.
+
+```{r Prediction}
+pred <- predict(modelFitRF, testing)
+data.frame(ID = testing$problem_id, Predicted.Class = pred)
+```
+
+# Appendix
+
+## Appendix A: Extra Code
+
+```{r mostCorrelated}
+## Calculate which variables are the most correlated
+# Most negatively correlated
+corMatrix[which.min(corMatrix)]
+indexmin <- which.min(corMatrix)
+rowmin <- rownames(corMatrix)[ifelse((indexmin %% 52) != 0, indexmin %% 52, 52)]
+colmin <- colnames(corMatrix)[ceiling(indexmin/52)]
+c(rowmin, colmin)
+cor(Train$accel_belt_z, Train$roll_belt)
+# Most positively correlated
+corMatrix[which.max(corMatrix)]
+indexmax <- which.max(corMatrix)
+rowmax <- rownames(corMatrix)[ifelse((indexmax %% 52) != 0, indexmax %% 52, 52)]
+colmax <- colnames(corMatrix)[ceiling(indexmax/52)]
+c(rowmax, colmax)
+cor(Train$total_accel_belt, Train$roll_belt)
+
+## Calculate which variables, different than roll_belt, are the most correlated
+corMatrix2 <- corMatrix[-1, -1]
+# Most negatively correlated
+corMatrix2[which.min(corMatrix2)]
+indexmin2 <- which.min(corMatrix2)
+rowmin2 <- rownames(corMatrix2)[ifelse((indexmin2 %% 51) != 0, indexmin2 %% 51, 51)]
+colmin2 <- colnames(corMatrix2)[ceiling(indexmin2/51)]
+c(rowmin2, colmin2)
+cor(Train$gyros_dumbbell_z, Train$gyros_dumbbell_x)
+# Most positively correlated
+corMatrix2[which.max(corMatrix2)]
+indexmax2 <- which.max(corMatrix2)
+rowmax2 <- rownames(corMatrix2)[ifelse((indexmax2 %% 51) != 0, indexmax2 %% 51, 51)]
+colmax2 <- colnames(corMatrix2)[ceiling(indexmax2/51)]
+c(rowmax2, colmax2)
+cor(Train$gyros_forearm_z, Train$gyros_dumbbell_z)
+
+## Correlation of the second most correlated variables after removing outliers
+Train2 <- Train[-which.max(Train$gyros_dumbbell_z), ]
+# Second most negatively correlated
+cor(Train2$gyros_dumbbell_z, Train2$gyros_dumbbell_x)
+# Second most positively correlated
+cor(Train2$gyros_forearm_z, Train2$gyros_dumbbell_z)
+```
+
+## Appendix B: Extra Plot
+
+```{r plotOutliersRemoved, fig.width = 8, fig.height = 4, fig.align = "center"}
+# Excluding roll_belt and outliers
+min2no <- ggplot(aes(x = gyros_dumbbell_z, y = gyros_dumbbell_x, col = classe), data = Train2) + 
+    geom_point(alpha = 0.5) + theme_bw()
+max2no <- ggplot(aes(x = gyros_forearm_z, y = gyros_dumbbell_z, col = classe), data = Train2) + 
+    geom_point(alpha = 0.5) + theme_bw()
+# Arranged plot
+grid.arrange(min2no, max2no, nrow = 1, ncol = 2)
+```
+
+# References
+
+[^1]: Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013. <http://groupware.les.inf.puc-rio.br/har%7D#ixzz6VCw3JT15>
